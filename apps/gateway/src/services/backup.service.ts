@@ -7,6 +7,7 @@
 
 import { Database } from '../db';
 import { UpstreamService } from './upstream.service';
+import { upstreamConfigs } from '../db/schema';
 
 export interface BackupExport {
   version: string;
@@ -35,12 +36,12 @@ export class BackupService {
 
   /**
    * Export all upstream providers to JSON with credentials
-   * Returns base64-encoded JSON for safe transmission
+   * Returns full backup object
    */
   async exportProviders(): Promise<BackupExport> {
     const upstreams = await this.db
       .select()
-      .from(require('../db/schema').upstreamConfigs);
+      .from(upstreamConfigs);
 
     const providers = upstreams.map((u: any) => ({
       id: u.id,
@@ -67,18 +68,20 @@ export class BackupService {
   }
 
   /**
-   * Export as downloadable JSON file (base64 encoded for safety)
+   * Export as base64-encoded JSON for safe transmission/download
    */
   async exportAsBase64(): Promise<string> {
     const backup = await this.exportProviders();
     const jsonStr = JSON.stringify(backup, null, 2);
-    return Buffer.from(jsonStr).toString('base64');
+    const encoded = new TextEncoder().encode(jsonStr);
+    const binary = Array.from(encoded).map((b) => String.fromCharCode(b)).join('');
+    return btoa(binary);
   }
 
   /**
    * Import providers from backup JSON
    * - Validates checksum
-   * - Skips duplicate IDs
+   * - Skips duplicate IDs or overwrites based on options
    * - Returns import report
    */
   async importProviders(
@@ -180,7 +183,16 @@ export class BackupService {
    * Decode base64 backup file back to JSON
    */
   decodeBackupFile(base64Data: string): BackupExport {
-    const jsonStr = Buffer.from(base64Data, 'base64').toString('utf-8');
-    return JSON.parse(jsonStr);
+    try {
+      const binaryString = atob(base64Data);
+      const bytes = new Uint8Array(binaryString.length);
+      for (let i = 0; i < binaryString.length; i++) {
+        bytes[i] = binaryString.charCodeAt(i);
+      }
+      const jsonStr = new TextDecoder().decode(bytes);
+      return JSON.parse(jsonStr);
+    } catch (err: any) {
+      throw new Error(`Failed to decode backup file: ${err.message}`);
+    }
   }
 }
