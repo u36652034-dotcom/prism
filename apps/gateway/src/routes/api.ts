@@ -6,6 +6,8 @@ import { UpstreamService } from '../services/upstream.service';
 import { AuditLogService } from '../services/audit.service';
 import { SettingsService } from '../services/settings.service';
 import { AuthService, hashPassword, comparePassword } from '../services/auth.service';
+import { BackupService } from '../services/backup.service';
+import { FallbackService } from '../services/fallback.service';
 import { getDb } from '../db';
 
 const api = new Hono<GatewayContext>();
@@ -318,77 +320,86 @@ api.delete('/upstreams/:id', async (c) => {
   }
 });
 
-// 8. GET /api/settings - Fetch global system settings (Sanitizing sensitive tokens)
-api.get('/settings', async (c) => {
-  const settingsService = new SettingsService(getDb(c.env.DB));
-  const rawData = await settingsService.getAllSettings();
+// ============================================================================
+// NEW: BACKUP & RESTORE ENDPOINTS (Feature 1 & 2)
+// ============================================================================
 
-  const response = {
-    cf_account_id: rawData.cf_account_id || '',
-    cf_gateway_id: rawData.cf_gateway_id || 'default',
-    cf_api_token_configured: Boolean(rawData.cf_api_token && rawData.cf_api_token.trim().length > 0),
-    admin_username: rawData.admin_username || DEFAULT_ADMIN_USERNAME,
-    timezone_mode: (rawData.timezone_mode as 'UTC' | 'system') || 'UTC',
-    log_storage_engine: (rawData.log_storage_engine as 'd1' | 'r2') || 'd1',
-  };
-
-  return c.json({ data: response });
-});
-
-// 9. POST /api/settings - Update global system settings
-api.post('/settings', async (c) => {
+// GET /api/backup/export - Export all providers as JSON
+api.get('/backup/export', async (c) => {
   try {
-    const body = await c.req.json();
-    const settingsService = new SettingsService(getDb(c.env.DB));
-    const currentSettings = await settingsService.getAllSettings();
+    const backupService = new BackupService(getDb(c.env.DB));
+    const backupData = await backupService.exportProviders();
 
-    const updatePayload: Record<string, string> = {};
-    if (typeof body.cf_account_id === 'string') {
-      updatePayload.cf_account_id = body.cf_account_id.trim();
-    }
-    if (typeof body.cf_gateway_id === 'string') {
-      updatePayload.cf_gateway_id = body.cf_gateway_id.trim() || 'default';
-    }
-    if (typeof body.timezone_mode === 'string') {
-      updatePayload.timezone_mode = body.timezone_mode === 'system' ? 'system' : 'UTC';
-    }
-    if (typeof body.log_storage_engine === 'string') {
-      updatePayload.log_storage_engine = body.log_storage_engine === 'r2' ? 'r2' : 'd1';
-    }
-
-    // Only update cf_api_token if user explicitly passed a non-undefined value
-    // If cf_api_token is passed as empty string '', it clears the token.
-    // If cf_api_token is omitted or null, it retains the existing token in DB.
-    if (body.cf_api_token !== undefined && body.cf_api_token !== null) {
-      updatePayload.cf_api_token = body.cf_api_token.trim();
-    }
-
-    if (typeof body.admin_username === 'string' && body.admin_username.trim()) {
-      updatePayload.admin_username = body.admin_username.trim();
-    }
-
-    if (typeof body.admin_password === 'string' && body.admin_password) {
-      // If admin_password_hash already exists in DB (not initial force change),
-      // verify the provided old_admin_password first.
-      if (currentSettings.admin_password_hash) {
-        if (!body.old_admin_password) {
-          return c.json({ error: 'Old password is required to change admin password' }, 400);
-        }
-        const isOldPasswordMatch = await comparePassword(body.old_admin_password, currentSettings.admin_password_hash);
-        if (!isOldPasswordMatch) {
-          return c.json({ error: 'Incorrect old password' }, 400);
-        }
-      }
-
-      updatePayload.admin_password_hash = await hashPassword(body.admin_password);
-    }
-
-    await settingsService.saveSettings(updatePayload);
-    return c.json({ success: true });
+    return c.json(
+      {
+        success: true,
+        message: `Exported ${backupData.providerCount} providers`,
+        backup: backupData,
+      },
+      200
+    );
   } catch (err: any) {
-    return c.json({ error: err.message }, 400);
+    return c.json({ error: err.message || 'Export failed' }, 500);
   }
 });
 
-export default api;
+// GET /api/backup/export-download - Export as base64 for browser download
+api.get('/backup/export-download', async (c) => {
+  try {
+    const backupService = new BackupService(getDb(c.env.DB));
+    const base64Data = await backupService.exportAsBase64();
+    const timestamp = new Date().toISOString().slice(0, 10);
 
+    return new Response(base64Data, {
+      status: 200,
+      headers: {
+        'Content-Type': 'application/octet-stream',
+        'Content-Disposition': `attachment; filename="prism-backup-${timestamp}.json.b64"`,
+      },
+    });
+  } catch (err: any) {
+    return c.json({ error: err.message || 'Export failed' }, 500);
+  }
+});
+
+// POST /api/backup/import - Import providers from JSON backup
+api.post('/backup/import', async (c) => {
+  try {
+    const body = await c.req.json();
+    const { backup: backupData, overwrite = false, skipDuplicates = true } = body;
+
+    if (!backupData || typeof backupData !== 'object') {
+      return c.json({ error: 'Invalid backup data format' }, 400);
+    }
+
+    const backupService = new BackupService(getDb(c.env.DB));
+    const result = await backupService.importProviders(backupData, {
+      overwrite,
+      skipDuplicates,
+    });
+
+    return c.json(result, result.success ? 200 : 400);
+  } catch (err: any) {
+    return c.json({ error: err.message || 'Import failed' }, 500);
+  }
+});
+
+// POST /api/backup/import-base64 - Import from base64-encoded backup file
+api.post('/backup/import-base64', async (c) => {
+  try {
+    const body = await c.req.json();
+    const { backupBase64, overwrite = false } = body;
+
+    if (!backupBase64 || typeof backupBase64 !== 'string') {
+      return c.json({ error: 'Invalid backup data format' }, 400);
+    }
+
+    const backupService = new BackupService(getDb(c.env.DB));
+    const backupData = backupService.decodeBackupFile(backupBase64);
+    const result = await backupService.importProviders(backupData, {
+      overwrite,
+      skipDuplicates: true,
+    });
+
+    return c.json(result, result.success ? 200 : 400);
+  } catch (err: any) {\n    return c.json({ error: err.message || 'Import failed' }, 500);\n  }\n});\n\n// ============================================================================\n// NEW: FALLBACK & HEALTH CHECK ENDPOINTS (Feature 3)\n// ============================================================================\n\n// GET /api/backup/health - Get health status of all providers\napi.get('/backup/health', async (c) => {\n  try {\n    const fallbackService = new FallbackService(getDb(c.env.DB));\n    const healthStatus = fallbackService.getAllHealthStatus();\n\n    return c.json({\n      success: true,\n      timestamp: new Date().toISOString(),\n      totalProviders: healthStatus.length,\n      healthyCount: healthStatus.filter((h) => h.status === 'healthy').length,\n      cooldownCount: healthStatus.filter((h) => h.status === 'cooldown').length,\n      disabledCount: healthStatus.filter((h) => h.status === 'disabled').length,\n      providers: healthStatus.map((h) => ({\n        id: h.id,\n        name: h.name,\n        status: h.status,\n        failures: h.failures,\n        lastFailure: h.lastFailure ? new Date(h.lastFailure).toISOString() : null,\n        cooldownUntil: h.cooldownUntil ? new Date(h.cooldownUntil).toISOString() : null,\n        failureReason: h.failureReason,\n      })),\n    });\n  } catch (err: any) {\n    return c.json({ error: err.message || 'Health check failed' }, 500);\n  }\n});\n\n// POST /api/backup/reset-health - Reset all provider health status (admin only)\napi.post('/backup/reset-health', async (c) => {\n  try {\n    const fallbackService = new FallbackService(getDb(c.env.DB));\n    fallbackService.resetAllHealth();\n\n    return c.json({\n      success: true,\n      message: 'All provider health status reset to healthy',\n    });\n  } catch (err: any) {\n    return c.json({ error: err.message || 'Reset failed' }, 500);\n  }\n});\n\n// 8. GET /api/settings - Fetch global system settings (Sanitizing sensitive tokens)\napi.get('/settings', async (c) => {\n  const settingsService = new SettingsService(getDb(c.env.DB));\n  const rawData = await settingsService.getAllSettings();\n\n  const response = {\n    cf_account_id: rawData.cf_account_id || '',\n    cf_gateway_id: rawData.cf_gateway_id || 'default',\n    cf_api_token_configured: Boolean(rawData.cf_api_token && rawData.cf_api_token.trim().length > 0),\n    admin_username: rawData.admin_username || DEFAULT_ADMIN_USERNAME,\n    timezone_mode: (rawData.timezone_mode as 'UTC' | 'system') || 'UTC',\n    log_storage_engine: (rawData.log_storage_engine as 'd1' | 'r2') || 'd1',\n  };\n\n  return c.json({ data: response });\n});\n\n// 9. POST /api/settings - Update global system settings\napi.post('/settings', async (c) => {\n  try {\n    const body = await c.req.json();\n    const settingsService = new SettingsService(getDb(c.env.DB));\n    const currentSettings = await settingsService.getAllSettings();\n\n    const updatePayload: Record<string, string> = {};\n    if (typeof body.cf_account_id === 'string') {\n      updatePayload.cf_account_id = body.cf_account_id.trim();\n    }\n    if (typeof body.cf_gateway_id === 'string') {\n      updatePayload.cf_gateway_id = body.cf_gateway_id.trim() || 'default';\n    }\n    if (typeof body.timezone_mode === 'string') {\n      updatePayload.timezone_mode = body.timezone_mode === 'system' ? 'system' : 'UTC';\n    }\n    if (typeof body.log_storage_engine === 'string') {\n      updatePayload.log_storage_engine = body.log_storage_engine === 'r2' ? 'r2' : 'd1';\n    }\n\n    // Only update cf_api_token if user explicitly passed a non-undefined value\n    // If cf_api_token is passed as empty string '', it clears the token.\n    // If cf_api_token is omitted or null, it retains the existing token in DB.\n    if (body.cf_api_token !== undefined && body.cf_api_token !== null) {\n      updatePayload.cf_api_token = body.cf_api_token.trim();\n    }\n\n    if (typeof body.admin_username === 'string' && body.admin_username.trim()) {\n      updatePayload.admin_username = body.admin_username.trim();\n    }\n\n    if (typeof body.admin_password === 'string' && body.admin_password) {\n      // If admin_password_hash already exists in DB (not initial force change),\n      // verify the provided old_admin_password first.\n      if (currentSettings.admin_password_hash) {\n        if (!body.old_admin_password) {\n          return c.json({ error: 'Old password is required to change admin password' }, 400);\n        }\n        const isOldPasswordMatch = await comparePassword(body.old_admin_password, currentSettings.admin_password_hash);\n        if (!isOldPasswordMatch) {\n          return c.json({ error: 'Incorrect old password' }, 400);\n        }\n      }\n\n      updatePayload.admin_password_hash = await hashPassword(body.admin_password);\n    }\n\n    await settingsService.saveSettings(updatePayload);\n    return c.json({ success: true });\n  } catch (err: any) {\n    return c.json({ error: err.message }, 400);\n  }\n});\n\nexport default api;\n
